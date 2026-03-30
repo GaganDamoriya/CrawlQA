@@ -7,7 +7,8 @@ async function bootstrap() {
     origin: 'http://localhost:3000',
     methods: ['GET', 'POST'],
   });
-  await app.listen(3001);
-  console.log('Backend running on http://localhost:3001');
+  const port = process.env.PORT ?? 7432;
+  await app.listen(port);
+  console.log(`Backend running on http://localhost:${port}`);
 }
 bootstrap();

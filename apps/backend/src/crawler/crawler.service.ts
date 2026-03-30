@@ -3,10 +3,20 @@ import { chromium } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as url from 'url';
+import { AnalysisService, Issue } from '../analysis/analysis.service';
 
-export interface PageElement {
+export interface UIElement {
+  id: number;
   tag: string;
   text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface ClippedElement {
+  tag: string;
   x: number;
   y: number;
   width: number;
@@ -32,7 +42,8 @@ export interface PageResult {
     viewport: { width: number; height: number };
     document: { scrollWidth: number; scrollHeight: number };
   };
-  elements: PageElement[];
+  uiElements: UIElement[];
+  clippedElements: ClippedElement[];
   meta: {
     description: string;
     lang: string;
@@ -42,8 +53,15 @@ export interface PageResult {
   images: PageImage[];
 }
 
+export interface PageAnalysisResult {
+  url: string;
+  title: string;
+  screenshotPath: string;
+  issues: Issue[];
+}
+
 export interface CrawlResult {
-  pages: PageResult[];
+  pages: PageAnalysisResult[];
 }
 
 function normalizeUrl(rawUrl: string): string {
@@ -54,7 +72,7 @@ function normalizeUrl(rawUrl: string): string {
 export class CrawlerService {
   private readonly screenshotsDir = path.join(process.cwd(), 'screenshots');
 
-  constructor() {
+  constructor(private readonly analysisService: AnalysisService) {
     if (!fs.existsSync(this.screenshotsDir)) {
       fs.mkdirSync(this.screenshotsDir, { recursive: true });
     }
@@ -66,7 +84,7 @@ export class CrawlerService {
     const hostname = parsedBase.hostname.replace(/\./g, '-');
 
     const visited = new Set<string>();
-    const pages: PageResult[] = [];
+    const pages: PageAnalysisResult[] = [];
 
     const browser = await chromium.launch({ headless: true });
 
@@ -78,10 +96,19 @@ export class CrawlerService {
         if (visited.has(currentUrl)) continue;
         visited.add(currentUrl);
 
+        // Delay between pages to respect Gemini free-tier rate limits (15 RPM)
+        if (i > 0) await new Promise((r) => setTimeout(r, 6000));
+
         const result = await this.crawlPage(browser, currentUrl, hostname, pages.length);
         if (!result) continue;
 
-        pages.push(result);
+        const issues = await this.analysisService.analyzePage(result);
+        pages.push({
+          url: result.url,
+          title: result.title,
+          screenshotPath: result.screenshotPath,
+          issues,
+        });
 
         // Only collect more links from the first page (homepage)
         if (i === 0) {
@@ -116,7 +143,6 @@ export class CrawlerService {
     console.log(`Crawling: ${pageUrl}`);
     const page = await browser.newPage();
 
-    // Collect console errors before navigation
     const consoleErrors: string[] = [];
     page.on('console', (msg: any) => {
       if (msg.type() === 'error') consoleErrors.push(msg.text());
@@ -128,15 +154,13 @@ export class CrawlerService {
         timeout: 20000,
       });
 
-      // Wait for network to go quiet (images, fonts, async data)
       await page.waitForLoadState('networkidle').catch(() => {
         console.log(`networkidle timeout for ${pageUrl}, continuing anyway`);
       });
 
-      // Extra buffer for JS-rendered content
       await page.waitForTimeout(2000);
 
-      // Scroll down to trigger lazy-loaded content
+      // Scroll to trigger lazy-loaded content
       await page.evaluate(async () => {
         await new Promise<void>((resolve) => {
           let totalHeight = 0;
@@ -152,7 +176,6 @@ export class CrawlerService {
         });
       });
 
-      // Scroll back to top before extraction + screenshot
       await page.evaluate(() => window.scrollTo(0, 0));
 
       const title = await page.title();
@@ -177,22 +200,13 @@ export class CrawlerService {
         },
       }));
 
-      const elements: PageElement[] = await page.evaluate(() =>
-        Array.from(
-          document.querySelectorAll('button,input,select,textarea,a,h1,h2'),
-        )
-          .slice(0, 50)
-          .map((el: Element) => {
+      const uiElements: UIElement[] = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('button,a,p,h1,h2,h3,span'))
+          .map((el: Element, idx: number) => {
             const r = el.getBoundingClientRect();
-            const text = (
-              el.textContent ||
-              el.getAttribute('placeholder') ||
-              el.getAttribute('aria-label') ||
-              ''
-            )
-              .trim()
-              .slice(0, 100);
+            const text = (el.textContent || '').trim().slice(0, 200);
             return {
+              id: idx + 1,
               tag: el.tagName.toLowerCase(),
               text,
               x: Math.round(r.x),
@@ -201,7 +215,31 @@ export class CrawlerService {
               height: Math.round(r.height),
             };
           })
-          .filter((el) => el.width > 0 && el.height > 0),
+          .filter((el) => el.text && el.width > 0 && el.height > 0)
+          .slice(0, 100),
+      );
+
+      const clippedElements: ClippedElement[] = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('*'))
+          .filter((el: Element) => {
+            const style = window.getComputedStyle(el);
+            const ov = style.overflow + style.overflowX + style.overflowY;
+            return (
+              (ov.includes('hidden') || ov.includes('clip')) &&
+              (el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight)
+            );
+          })
+          .slice(0, 5)
+          .map((el: Element) => {
+            const r = el.getBoundingClientRect();
+            return {
+              tag: el.tagName.toLowerCase(),
+              x: Math.round(r.x),
+              y: Math.round(r.y),
+              width: Math.round(r.width),
+              height: Math.round(r.height),
+            };
+          }),
       );
 
       const meta = await page.evaluate(() => ({
@@ -239,7 +277,8 @@ export class CrawlerService {
         text: text.slice(0, 5000),
         links,
         layout,
-        elements,
+        uiElements,
+        clippedElements,
         meta,
         consoleErrors,
         images,
